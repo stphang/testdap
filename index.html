@@ -1,0 +1,465 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Microphone Spike Detector (Static)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background: #f6f7fb
+        }
+
+        .panel {
+            border: 1px solid #ddd;
+            padding: 12px;
+            border-radius: 6px;
+            background: #fff
+        }
+
+        .panel h3 {
+            margin: 0 0 8px 0;
+            font-size: 16px
+        }
+
+        #controls {
+            margin-bottom: 12px;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap
+        }
+
+        #visuals {
+            display: flex;
+            gap: 12px;
+            margin-top: 12px;
+            flex-wrap: wrap
+        }
+
+        #log {
+            white-space: pre-wrap;
+            font-family: monospace;
+            margin-top: 12px
+        }
+
+        canvas {
+            background: #fff
+        }
+
+        .alert-badge {
+            width: 100%;
+            text-align: center;
+            padding: 8px;
+            border-radius: 6px;
+            font-weight: bold;
+            background: #eee;
+            color: #333
+        }
+
+        .alert-badge.active {
+            background: #cc3333;
+            color: #fff;
+            box-shadow: 0 0 8px rgba(204, 51, 51, 0.6);
+        }
+
+        #bigAlert.hidden {
+            display: none
+        }
+
+        #snapshotsPanel {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        #snapshotsPanel figure {
+            margin: 0;
+            text-align: center;
+            font-size: 11px;
+        }
+
+        #snapshotsPanel img {
+            max-width: 140px;
+            border: 1px solid #ccc;
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Microphone Spike Detector</h2>
+    <div id="bigAlert"
+        style="display:none;margin-top:8px;padding:10px;border-radius:6px;font-weight:bold;color:#fff;background:#cc0000;text-align:center">
+        ALERT</div>
+
+    <div class="panel">
+        <h3>Controls</h3>
+        <div id="controls">
+            <button id="recBtn">Start Recording</button>
+            <button id="stopBtn" disabled>Stop & Analyze</button>
+            <label for="deviceSelect">Input device:</label>
+            <select id="deviceSelect" style="min-width:220px"></select>
+            <button id="refreshDevices" title="Refresh device list">Refresh</button>
+            <label for="silenceThresh">Silence threshold:</label>
+            <input id="silenceThresh" type="range" min="0" max="0.01" step="0.0001" value="0.001" />
+            <input id="silenceVal" type="number" step="0.0001" min="0" max="1" value="0.001" style="width:80px" />
+        </div>
+    </div>
+
+    <div id="visuals" style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-top:12px">
+        <div class="panel" style="flex:1;min-width:320px;max-width:740px">
+            <h3>Audio — Live Visuals</h3>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+                <canvas id="waveformCanvas" width="700" height="120" style="border:1px solid #ccc"></canvas>
+                <canvas id="spectrogramCanvas" width="700" height="140" style="border:1px solid #ccc"></canvas>
+            </div>
+        </div>
+
+        <div class="panel" style="width:360px;display:flex;flex-direction:column;gap:8px;align-items:center">
+            <h3>Video + Alerts</h3>
+            <video id="liveVideo" width="320" height="240" autoplay playsinline
+                style="border:1px solid #ccc; display:none;"></video>
+            <canvas id="energyCanvas" width="320" height="120" style="border:1px solid #ccc"></canvas>
+            <div style="width:100%">
+                <label for="alertThresh" style="display:block;margin-bottom:6px">Alert threshold (dB):</label>
+                <input id="alertThresh" type="range" min="-80" max="0" step="0.5" value="-40" style="width:100%" />
+            </div>
+            <div id="liveAlert" class="alert-badge" style="margin-top:6px">(none)</div>
+            <div style="margin-top:6px"><strong>Detection:</strong> <span id="alertText">(none)</span></div>
+            <div style="margin-top:6px"><strong>Emergency:</strong> <span id="emergencyLabel"
+                    style="font-weight:bold;color:darkred">(none)</span></div>
+        </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+        <h3>Analysis (computed in-browser, no server)</h3>
+        <div><img id="analysisImg" alt="Analysis" style="max-width:600px; border:1px solid #ccc" /></div>
+        <div id="log" style="margin-top:8px"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+        <h3>Snapshots (kept in this browser tab only)</h3>
+        <div id="snapshotsPanel"></div>
+    </div>
+
+    <script>
+        // Elements
+        const recBtn = document.getElementById('recBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const alertText = document.getElementById('alertText');
+        const analysisImg = document.getElementById('analysisImg');
+        const logDiv = document.getElementById('log');
+        const silenceThreshRange = document.getElementById('silenceThresh');
+        const silenceValInput = document.getElementById('silenceVal');
+        const waveformCanvas = document.getElementById('waveformCanvas');
+        const waveformCtx = waveformCanvas.getContext('2d');
+        const spectrogramCanvas = document.getElementById('spectrogramCanvas');
+        const spectCtx = spectrogramCanvas.getContext('2d');
+        const energyCanvas = document.getElementById('energyCanvas');
+        const energyCtx = energyCanvas.getContext('2d');
+        const alertThresh = document.getElementById('alertThresh');
+        const liveAlert = document.getElementById('liveAlert');
+        const emergencyLabel = document.getElementById('emergencyLabel');
+        const snapshotsPanel = document.getElementById('snapshotsPanel');
+
+        // audio state
+        let audioContext, source, processor, chunks = [], sampleRate;
+        let analyser, freqData, timeData;
+        let eventLog = [];
+
+        // speech recognizer for keyword (Help)
+        let recognizer = null;
+        // camera state
+        let cameraStream = null;
+        const liveVideo = document.getElementById('liveVideo');
+
+        async function startCamera() {
+            if (cameraStream) return; // already running
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                liveVideo.srcObject = cameraStream;
+                liveVideo.style.display = 'block';
+            } catch (err) {
+                console.warn('Camera permission denied or not available', err);
+            }
+        }
+
+        function captureSnapshot() {
+            if (!cameraStream) return null;
+            try {
+                const v = liveVideo;
+                const c = document.createElement('canvas');
+                c.width = v.videoWidth || 320; c.height = v.videoHeight || 240;
+                const ctx = c.getContext('2d');
+                ctx.drawImage(v, 0, 0, c.width, c.height);
+                return c.toDataURL('image/png');
+            } catch (e) { return null; }
+        }
+
+        function addSnapshotThumbnail(dataUrl) {
+            const fig = document.createElement('figure');
+            const img = document.createElement('img');
+            img.src = dataUrl;
+            const caption = document.createElement('figcaption');
+            caption.textContent = new Date().toLocaleTimeString();
+            fig.appendChild(img); fig.appendChild(caption);
+            snapshotsPanel.prepend(fig);
+            while (snapshotsPanel.children.length > 8) snapshotsPanel.removeChild(snapshotsPanel.lastChild);
+        }
+
+        function stopCamera() {
+            if (!cameraStream) return;
+            try {
+                const tracks = cameraStream.getTracks();
+                for (let t of tracks) t.stop();
+            } catch (e) { }
+            cameraStream = null;
+            liveVideo.srcObject = null;
+            liveVideo.style.display = 'none';
+        }
+
+        // keep range and numeric input in sync
+        silenceThreshRange.addEventListener('input', (e) => { silenceValInput.value = e.target.value; });
+        silenceValInput.addEventListener('input', (e) => { silenceThreshRange.value = e.target.value; });
+
+        // device list
+        async function listInputDevices() {
+            const select = document.getElementById('deviceSelect');
+            select.innerHTML = '';
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const inputs = devices.filter(d => d.kind === 'audioinput');
+                if (inputs.length === 0) {
+                    const opt = document.createElement('option'); opt.text = 'No audio input devices found'; opt.value = ''; select.appendChild(opt); return;
+                }
+                const defaultOpt = document.createElement('option'); defaultOpt.text = 'Default device'; defaultOpt.value = ''; select.appendChild(defaultOpt);
+                for (let d of inputs) {
+                    const opt = document.createElement('option'); opt.value = d.deviceId; opt.text = d.label || ('audioinput ' + d.deviceId); select.appendChild(opt);
+                }
+            } catch (err) {
+                const opt = document.createElement('option'); opt.text = 'Permission required to list devices'; opt.value = ''; select.appendChild(opt);
+            }
+        }
+
+        document.getElementById('refreshDevices').addEventListener('click', listInputDevices);
+        listInputDevices();
+
+        // visualization helpers
+        function drawWaveform(buf) {
+            const w = waveformCanvas.width, h = waveformCanvas.height;
+            waveformCtx.fillStyle = '#fff'; waveformCtx.fillRect(0, 0, w, h);
+            waveformCtx.lineWidth = 1; waveformCtx.strokeStyle = '#0077cc';
+            waveformCtx.beginPath();
+            const step = Math.max(1, Math.floor(buf.length / w));
+            for (let i = 0; i < w; i++) {
+                const idx = i * step;
+                const y = (0.5 + (buf[idx] || 0) / 2) * h;
+                if (i === 0) waveformCtx.moveTo(i, y); else waveformCtx.lineTo(i, y);
+            }
+            waveformCtx.stroke();
+        }
+
+        function drawSpectrogramColumn(freq) {
+            const w = spectrogramCanvas.width, h = spectrogramCanvas.height;
+            const img = spectCtx.getImageData(1, 0, w - 1, h);
+            spectCtx.putImageData(img, 0, 0);
+            const colX = w - 1;
+            for (let y = 0; y < h; y++) {
+                const bin = Math.floor((1 - y / h) * freq.length);
+                const v = freq[bin];
+                spectCtx.fillStyle = colormap(v);
+                spectCtx.fillRect(colX, y, 1, 1);
+            }
+        }
+
+        function colormap(v) {
+            const t = v / 255;
+            const r = Math.floor(255 * Math.min(1, 2 * t));
+            const g = Math.floor(255 * Math.max(0, Math.min(1, 2 * (t - 0.25))));
+            const b = Math.floor(255 * Math.max(0, 1 - 2 * t));
+            return `rgb(${r},${g},${b})`;
+        }
+
+        function computeRMS(buf) {
+            let sum = 0; for (let i = 0; i < buf.length; i++) { const v = buf[i]; sum += v * v; }
+            return Math.sqrt(sum / buf.length || 0);
+        }
+
+        function drawEnergy(rms) {
+            const w = energyCanvas.width, h = energyCanvas.height;
+            energyCtx.fillStyle = '#fff'; energyCtx.fillRect(0, 0, w, h);
+            const db = 20 * Math.log10(rms + 1e-12);
+            const barH = Math.max(0, Math.min(h, (db + 80) / 80 * h));
+            // color by level relative to threshold
+            const thresh = parseFloat(alertThresh.value) || -40;
+            const color = db > thresh ? '#cc3333' : '#28a745';
+            energyCtx.fillStyle = color; energyCtx.fillRect(10, h - barH, w - 20, barH);
+            energyCtx.fillStyle = '#000'; energyCtx.fillText(db.toFixed(1) + ' dB', 10, 12);
+        }
+
+        function checkAlert(rms, freq) {
+            const db = 20 * Math.log10(rms + 1e-12);
+            const thresh = parseFloat(alertThresh.value) || -40;
+            const maxBin = Math.max(...freq);
+            const spike = (db > thresh) || (maxBin > 200);
+            if (spike) {
+                liveAlert.textContent = 'SPIKE'; liveAlert.classList.add('active');
+                alertText.textContent = 'SPIKE';
+                const big = document.getElementById('bigAlert');
+                big.textContent = `SPIKE ALERT — ${db.toFixed(1)} dB`;
+                big.style.display = 'block';
+            } else {
+                liveAlert.textContent = '(none)'; liveAlert.classList.remove('active');
+                alertText.textContent = '(none)';
+                const big = document.getElementById('bigAlert');
+                big.style.display = 'none';
+            }
+        }
+
+        // Client-side replacement for the old Flask /analyze endpoint:
+        // recomputes short-time energy stats and renders a summary chart, all in-browser.
+        function analyzeSamplesClient(samples, sr) {
+            let maxAmp = 0;
+            for (let i = 0; i < samples.length; i++) { const v = Math.abs(samples[i]); if (v > maxAmp) maxAmp = v; }
+            const denom = maxAmp > 0 ? maxAmp + 1e-9 : 1;
+            const norm = new Float32Array(samples.length);
+            for (let i = 0; i < samples.length; i++) norm[i] = samples[i] / denom;
+
+            const frameLen = Math.max(1, Math.floor(0.02 * sr));
+            const hop = Math.max(1, Math.floor(frameLen / 2));
+            const energy = [];
+            for (let start = 0; start + frameLen <= norm.length; start += hop) {
+                let sum = 0;
+                for (let j = 0; j < frameLen; j++) { const v = norm[start + j]; sum += v * v; }
+                energy.push(sum / frameLen);
+            }
+            if (energy.length === 0) energy.push(0);
+
+            let peak = -Infinity, sum = 0;
+            for (const e of energy) { if (e > peak) peak = e; sum += e; }
+            const meanE = sum / energy.length;
+            let variance = 0;
+            for (const e of energy) variance += (e - meanE) * (e - meanE);
+            const stdE = Math.sqrt(variance / energy.length);
+            const score = (peak - meanE) / (stdE + 1e-9);
+            const threshold = meanE + 2.5 * stdE;
+            const isSpike = peak > threshold;
+            return { norm, energy, peak, meanE, stdE, score, threshold, isSpike };
+        }
+
+        function renderAnalysisImage(norm, energy, threshold) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 600; canvas.height = 300;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const wfH = 140;
+            ctx.strokeStyle = '#ccc'; ctx.strokeRect(0, 0, canvas.width, wfH);
+            ctx.strokeStyle = '#0077cc'; ctx.beginPath();
+            const step = Math.max(1, Math.floor(norm.length / canvas.width));
+            for (let x = 0; x < canvas.width; x++) {
+                const idx = x * step;
+                const y = wfH / 2 + (norm[idx] || 0) * wfH / 2 * 0.9;
+                if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            ctx.fillStyle = '#000'; ctx.font = '12px monospace'; ctx.fillText('Waveform', 6, 14);
+
+            const eH = 140, eY = wfH + 10;
+            let maxE = threshold;
+            for (const e of energy) if (e > maxE) maxE = e;
+            maxE = Math.max(maxE, 1e-9);
+            ctx.strokeStyle = '#ccc'; ctx.strokeRect(0, eY, canvas.width, eH);
+            ctx.strokeStyle = '#cc6600'; ctx.beginPath();
+            for (let i = 0; i < energy.length; i++) {
+                const x = (i / (energy.length - 1 || 1)) * canvas.width;
+                const y = eY + eH - (energy[i] / maxE) * eH;
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            const ty = eY + eH - (threshold / maxE) * eH;
+            ctx.setLineDash([4, 3]); ctx.strokeStyle = '#cc0000';
+            ctx.beginPath(); ctx.moveTo(0, ty); ctx.lineTo(canvas.width, ty); ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#000'; ctx.fillText('Energy (threshold = red dashed)', 6, eY + 14);
+
+            return canvas.toDataURL('image/png');
+        }
+
+        // Recording start
+        recBtn.onclick = async () => {
+            const deviceSelect = document.getElementById('deviceSelect');
+            const selectedDeviceId = deviceSelect && deviceSelect.value ? deviceSelect.value : null;
+            const audioConstraints = selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true;
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            sampleRate = audioContext.sampleRate;
+            source = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser(); analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.2;
+            freqData = new Uint8Array(analyser.frequencyBinCount); timeData = new Float32Array(analyser.fftSize);
+            source.connect(analyser);
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+            analyser.connect(processor); processor.connect(audioContext.destination);
+            processor.onaudioprocess = (e) => {
+                const data = e.inputBuffer.getChannelData(0); chunks.push(new Float32Array(data));
+                try { analyser.getFloatTimeDomainData(timeData); } catch (err) { for (let i = 0; i < Math.min(timeData.length, data.length); i++) timeData[i] = data[i]; }
+                analyser.getByteFrequencyData(freqData);
+                drawWaveform(timeData); drawSpectrogramColumn(freqData);
+                const rms = computeRMS(timeData); drawEnergy(rms); checkAlert(rms, freqData);
+            };
+            recBtn.disabled = true; stopBtn.disabled = false; alertText.textContent = 'Recording...'; emergencyLabel.textContent = '(none)';
+
+            // start speech recognition for keyword detection
+            try {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRecognition) {
+                    recognizer = new SpeechRecognition(); recognizer.continuous = true; recognizer.interimResults = false; recognizer.lang = 'en-US';
+                    recognizer.onresult = (ev) => {
+                        for (let i = ev.resultIndex; i < ev.results.length; i++) {
+                            const txt = ev.results[i][0].transcript || '';
+                            if (txt.toLowerCase().includes('help')) {
+                                emergencyLabel.textContent = 'EMERGENCY: help detected';
+                                emergencyLabel.style.color = 'red';
+                                // auto-enable camera for video capture
+                                startCamera();
+                                // take a snapshot after camera starts and keep it in this tab (no server to upload to)
+                                setTimeout(() => {
+                                    const snap = captureSnapshot();
+                                    if (snap) addSnapshotThumbnail(snap);
+                                }, 800);
+                            }
+                        }
+                    };
+                    recognizer.onerror = (err) => { /* ignore */ };
+                    recognizer.start();
+                }
+            } catch (err) { /* ignore */ }
+        };
+
+        // Stop and analyze fully in-browser (no server upload)
+        stopBtn.onclick = async () => {
+            try { processor && processor.disconnect(); source && source.disconnect(); } catch (e) { }
+            if (recognizer) { try { recognizer.stop(); } catch (e) { } recognizer = null; }
+            stopCamera();
+            let totalLen = 0; for (let c of chunks) totalLen += c.length; let samples = new Float32Array(totalLen); let offset = 0; for (let c of chunks) { samples.set(c, offset); offset += c.length; }
+            if (samples.length === 0) { alertText.textContent = 'No sound captured'; chunks = []; recBtn.disabled = false; stopBtn.disabled = true; return; }
+            let maxAmp = 0; for (let i = 0; i < samples.length; i++) { const v = Math.abs(samples[i]); if (v > maxAmp) maxAmp = v; }
+            const uiThresh = parseFloat(silenceValInput.value) || 0.001; if (maxAmp < uiThresh) { alertText.textContent = 'No sound captured'; chunks = []; recBtn.disabled = false; stopBtn.disabled = true; return; }
+
+            const result = analyzeSamplesClient(samples, sampleRate);
+            analysisImg.src = renderAnalysisImage(result.norm, result.energy, result.threshold);
+            const alert = result.isSpike ? 'SPIKE' : 'No spike';
+            alertText.textContent = `${alert} (score ${result.score.toFixed(2)})`;
+            const timestamp = new Date().toISOString();
+            eventLog.unshift(`${timestamp} | score=${result.score.toFixed(2)} | peak=${result.peak.toFixed(6)} | ${alert}`);
+            eventLog = eventLog.slice(0, 200);
+            logDiv.textContent = eventLog.join('\n');
+
+            chunks = []; recBtn.disabled = false; stopBtn.disabled = true;
+        };
+    </script>
+</body>
+
+</html>
