@@ -1,12 +1,15 @@
 ---
-sdk: gradio
-app_file: app.py
+sdk: static
+app_file: index.html
 --- 
 
 # Microphone Spike Detector
 
-Simple Gradio apps that captures microphone audio, computes short-time energy
-and a spectrogram, and raises spike alerts when the energy exceeds a threshold.
+Browser-only (no server) app that captures microphone audio, computes short-time
+energy and a spectrogram in JavaScript, and raises spike alerts when the energy
+exceeds a threshold. Runs entirely client-side, so it works on Hugging Face's
+free `static` Space SDK (no CPU quota required).
+
 
 Live demo: (deploy this repository to a Hugging Face Space with `sdk: gradio`)
 
